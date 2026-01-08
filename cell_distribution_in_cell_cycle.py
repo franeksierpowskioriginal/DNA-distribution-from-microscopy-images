@@ -15,10 +15,14 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import datetime
 from concurrent.futures import ProcessPoolExecutor
+from scipy.stats import iqr
 
-def compute_histogram(values, bins=500, q=0.99):
+def compute_histogram(values, q=0.99):
+    h = (2*iqr(values))/(len(values)**(1/3))
+    range = np.max(values) - np.min(values)
+    no_of_bins = round(range/h)
     upper = np.quantile(values, q)
-    return np.histogram(values, bins=bins, range=(0, upper))
+    return np.histogram(values, bins=no_of_bins, range=(0, upper))
 
 def s_phase_component(x, mu1, mu2, sigma_s, A_s, n_u = 100):
     u = np.linspace(mu1, mu2, n_u)
