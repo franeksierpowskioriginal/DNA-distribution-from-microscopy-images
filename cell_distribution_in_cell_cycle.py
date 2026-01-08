@@ -184,7 +184,7 @@ def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area
     #Generate a histogram showing the dispersion of nuclei intensities
     nuclei_intensities = []
     nuclei_intensities = df["RawIntDen"].astype(float).values
-    counts, bin_edges = compute_histogram(nuclei_intensities, bins=500, q=0.99)
+    counts, bin_edges = compute_histogram(nuclei_intensities, q=0.99)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     upper_lim = bin_edges[-1]
     step = round(upper_lim/5, -2)
@@ -261,7 +261,7 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
             print(f"No valid RawIntDen values in {filepath}, skipping")
             return
 
-        counts, bin_edges = compute_histogram(nuclei_intensities, bins=500, q=0.99)
+        counts, bin_edges = compute_histogram(nuclei_intensities, q=0.99)
     except Exception as e:
         print(f"Error processing {filepath}: {e}")
         return
@@ -298,13 +298,14 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     duration = end - start
     print("Model components calculation completed, execution time: ", duration)
     
-    model_path = os.path.join(output_dir, f"{name}_model.png")
+    final_model_path = os.path.join(output_dir, f"{name}_model.png")
+    initial_model_path = os.path.join(output_dir, f"{name}_initial_model.png")
     
     start = datetime.datetime.now()
     print("Generating the plots")
-    plt.figure(figsize=(18, 6))
-
-    plt.subplot(1, 2, 2)
+    
+    plt.figure(figsize=(8, 8))
+    
     plt.plot(bin_centers, counts, 'o', label='Data')
     plt.plot(bin_centers, fitted, '-', label='DJF fit')
     plt.plot(bin_centers, G1, '-', label='G1')
@@ -314,8 +315,10 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     plt.xlabel('DAPI intensity')
     plt.ylabel('Counts')
     plt.title('Fit Results')
+    plt.savefig(final_model_path)
+    plt.close()
 
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(8, 8))
     plt.plot(bin_centers, counts, 'o', label='Data')
     plt.plot(bin_centers, model_function, '-', label='Initial model')
     plt.plot(bin_centers, G1_p0, '-', label='G1_p0')
@@ -325,9 +328,7 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     plt.xlabel('DAPI intensity')
     plt.ylabel('Counts')
     plt.title('Initial Model Components')
-
-    plt.tight_layout()
-    plt.savefig(model_path)
+    plt.savefig(initial_model_path)
     plt.close()
     
     end = datetime.datetime.now()
