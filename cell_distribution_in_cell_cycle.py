@@ -15,15 +15,21 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import datetime
 from concurrent.futures import ProcessPoolExecutor
+from scipy.stats import iqr
+import datapane as dp
 
-def compute_histogram(values, bins=500, q=0.99):
+
+def compute_histogram(values, q=0.99):
+    h = (2*iqr(values))/(len(values)**(1/3))
+    range = np.max(values) - np.min(values)
+    no_of_bins = round(range/h)
     upper = np.quantile(values, q)
-    return np.histogram(values, bins=bins, range=(0, upper))
+    return np.histogram(values, bins=no_of_bins, range=(0, upper))
 
 def s_phase_component(x, mu1, mu2, sigma_s, A_s, n_u = 100):
     u = np.linspace(mu1, mu2, n_u)
     gaussian = np.exp(-0.5 * ((x[:, None] - u[None, :]) / sigma_s)**2)
-    S = np.trapezoid(gaussian, u)
+    S = np.trapz(gaussian, u)
     return A_s * S / S.max()
 
 def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area):
@@ -180,7 +186,7 @@ def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area
     #Generate a histogram showing the dispersion of nuclei intensities
     nuclei_intensities = []
     nuclei_intensities = df["RawIntDen"].astype(float).values
-    counts, bin_edges = compute_histogram(nuclei_intensities, bins=500, q=0.99)
+    counts, bin_edges = compute_histogram(nuclei_intensities, q=0.99)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     upper_lim = bin_edges[-1]
     step = round(upper_lim/5, -2)
@@ -257,7 +263,7 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
             print(f"No valid RawIntDen values in {filepath}, skipping")
             return
 
-        counts, bin_edges = compute_histogram(nuclei_intensities, bins=500, q=0.99)
+        counts, bin_edges = compute_histogram(nuclei_intensities, q=0.99)
     except Exception as e:
         print(f"Error processing {filepath}: {e}")
         return
@@ -294,13 +300,14 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     duration = end - start
     print("Model components calculation completed, execution time: ", duration)
     
-    model_path = os.path.join(output_dir, f"{name}_model.png")
+    final_model_path = os.path.join(output_dir, f"{name}_model.png")
+    initial_model_path = os.path.join(output_dir, f"{name}_initial_model.png")
     
     start = datetime.datetime.now()
     print("Generating the plots")
-    plt.figure(figsize=(18, 6))
-
-    plt.subplot(1, 2, 2)
+    
+    plt.figure(figsize=(8, 8))
+    
     plt.plot(bin_centers, counts, 'o', label='Data')
     plt.plot(bin_centers, fitted, '-', label='DJF fit')
     plt.plot(bin_centers, G1, '-', label='G1')
@@ -310,8 +317,10 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     plt.xlabel('DAPI intensity')
     plt.ylabel('Counts')
     plt.title('Fit Results')
+    plt.savefig(final_model_path)
+    plt.close()
 
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(8, 8))
     plt.plot(bin_centers, counts, 'o', label='Data')
     plt.plot(bin_centers, model_function, '-', label='Initial model')
     plt.plot(bin_centers, G1_p0, '-', label='G1_p0')
@@ -321,9 +330,7 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     plt.xlabel('DAPI intensity')
     plt.ylabel('Counts')
     plt.title('Initial Model Components')
-
-    plt.tight_layout()
-    plt.savefig(model_path)
+    plt.savefig(initial_model_path)
     plt.close()
     
     end = datetime.datetime.now()
@@ -332,15 +339,45 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     
     start = datetime.datetime.now()
     print("Calculating the fractions of cells and saving the results")    
-    total_area = np.trapezoid(fitted, bin_centers)
-    frac_G1 = np.trapezoid(G1, bin_centers) / total_area
-    frac_S  = np.trapezoid(S,  bin_centers) / total_area
-    frac_G2 = np.trapezoid(G2, bin_centers) / total_area
+    total_area = np.trapz(fitted, bin_centers)
+    frac_G1 = np.trapz(G1, bin_centers) / total_area
+    frac_S  = np.trapz(S,  bin_centers) / total_area
+    frac_G2 = np.trapz(G2, bin_centers) / total_area
     
-    rows.append([name, frac_G1, frac_S, frac_G2])  
     end = datetime.datetime.now()
     duration = end - start
     print("Calculation completed, execution time: ", duration)
+    return frac_G1, frac_S, frac_G2
+    
+def plot_cell_cycle(results_csv_path, output_dir):
+    
+    df = pd.read_csv(results_csv_path)
+    
+    df['row'] = df.index
+    
+    x = np.arange(len(df))  # [0, 1, 2, ...]
+    #width = 0.8
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    ax.bar(x, df['frac_G1'], label='G1', color='#1f77b4')
+    ax.bar(x, df['frac_S'], bottom=df['frac_G1'], label='S', color='#ff7f0e')
+    ax.bar(x, df['frac_G2'], bottom=df['frac_G1'] + df['frac_S'], label='G2', color='#2ca02c')
+
+
+    ax.set_xlabel('Sample (row number)')
+    ax.set_ylabel('Fraction of cells')
+    ax.set_title('Cell cycle phase distribution by sample')
+    ax.set_xticks(x)
+    ax.set_xticklabels(df['row'].astype(str))
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'Cell_cycle_barplot.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Stacked bar plot saved: {plot_path}")
     
 def process_image_wrapper(args):
     return process_image(*args)
@@ -349,8 +386,8 @@ def main():
     input_dir = sys.argv[1]
     output_dir = sys.argv[2]
     size_of_1px = float(sys.argv[3])
-    max_nucleus_area = float(sys.argv[4])
-    min_nucleus_area = float(sys.argv[5])
+    min_nucleus_area = float(sys.argv[4])
+    max_nucleus_area = float(sys.argv[5])
     max_nucleus_area = max_nucleus_area/size_of_1px*2
     min_nucleus_area = min_nucleus_area/size_of_1px*2
 
@@ -367,18 +404,66 @@ def main():
     valid_csv_files = [f for f in csv_files if not f.endswith('Results.csv')]
     
     rows = []
+    
     for filepath in valid_csv_files:
         filename = os.path.basename(filepath).split('.')[0]
         print(f"Quantifying cell cycle phases in: {filename}")
-        quantify_cell_cycle(filepath, filename, output_dir, rows)
+        n_cells = len(pd.read_csv(filepath))
+        frac_row = quantify_cell_cycle(filepath, filename, output_dir, rows)
+        rows.append([filename, n_cells, *frac_row])
     
     if rows:
-        df = pd.DataFrame(rows, columns=["ID", "frac_G1", "frac_S", "frac_G2"])
+        df = pd.DataFrame(rows, columns=["ID", "n_cells", "frac_G1", "frac_S", "frac_G2"])
         results_path = os.path.join(output_dir, "Results.csv")
         df.to_csv(results_path, index=False)
         print(f"Results saved: {len(rows)} samples analyzed")
+        plot_cell_cycle(results_path, output_dir)
     else:
         print("No valid data for cell cycle analysis")
+        
+    #generate datapane report
+    results_df = pd.read_csv(results_path)
+    summary_table = dp.Table(results_df)
+    results_png = os.path.join(output_dir, f"Cell_cycle_barplot.png")
+    results_plot = dp.Media(file=results_png)
+
+    sample_blocks = []
+    for _, row in results_df.iterrows():
+        sample_id = row["ID"]
+        n_cells = int(row["n_cells"])
+
+        mask_path       = os.path.join(output_dir, f"{sample_id}_mask.png")
+        hist_path       = os.path.join(output_dir, f"{sample_id}_histogram.png")
+        final_model     = os.path.join(output_dir, f"{sample_id}_model.png")
+        initial_model   = os.path.join(output_dir, f"{sample_id}_initial_model.png")
+        
+
+        sample_blocks.append(
+            dp.Group(
+                dp.Text(f"### Sample: {sample_id}"),
+                dp.Text(f"Total nuclei: **{n_cells}**"),
+                dp.Media(file=mask_path, caption="Nuclei masks"),
+                dp.Media(file=hist_path, caption="DAPI intensity histogram"),
+                dp.Media(file=initial_model, caption="Initial model components"),
+                dp.Media(file=final_model, caption="Fitted model"),
+                label=sample_id,
+            )
+        )
+
+    sample_select = dp.Select(blocks=sample_blocks, type=dp.SelectType.DROPDOWN)
+
+    report = dp.Report(
+        dp.Text("# Cell cycle analysis report"),
+        dp.Text("## Summary"),
+        results_plot,
+        summary_table,
+        dp.Text("## Per-sample details"),
+        sample_select,
+    )
+
+    report.save(path=os.path.join(output_dir, "report.html"), open=True)
+
 
 if __name__ == "__main__":
     main()
+    
