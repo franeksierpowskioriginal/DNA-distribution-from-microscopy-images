@@ -450,7 +450,7 @@ def main():
             )
         )
 
-    sample_select = dp.Select(blocks=sample_blocks, type=dp.SelectType.DROPDOWN)   # dropdown by sample name[web:86][web:87]
+    sample_select = dp.Select(blocks=sample_blocks, type=dp.SelectType.DROPDOWN)
 
     report = dp.Report(
         dp.Text("# Cell cycle analysis report"),
