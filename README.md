@@ -14,3 +14,5 @@ Quick Start
 3. Activate: `venv312\Scripts\Activate.ps1` (PowerShell) or `activate.bat` (cmd)
 4. Install deps: `pip install -r requirements.txt`
 5. Run: `python cell_distribution_in_cell_cycle.py input_dir output_dir pixel_size min_area max_area` (pixel size in μm, min_area and max_area in μm^2)
+
+Outputs masks, histograms, CSV results, and interactive HTML report in `output_dir`
