@@ -349,6 +349,36 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     print("Calculation completed, execution time: ", duration)
     return frac_G1, frac_S, frac_G2
     
+def plot_cell_cycle(results_csv_path, output_dir):
+    
+    df = pd.read_csv(results_csv_path)
+    
+    df['row'] = df.index
+    
+    x = np.arange(len(df))  # [0, 1, 2, ...]
+    #width = 0.8
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    ax.bar(x, df['frac_G1'], label='G1', color='#1f77b4')
+    ax.bar(x, df['frac_S'], bottom=df['frac_G1'], label='S', color='#ff7f0e')
+    ax.bar(x, df['frac_G2'], bottom=df['frac_G1'] + df['frac_S'], label='G2', color='#2ca02c')
+
+
+    ax.set_xlabel('Sample (row number)')
+    ax.set_ylabel('Fraction of cells')
+    ax.set_title('Cell cycle phase distribution by sample')
+    ax.set_xticks(x)
+    ax.set_xticklabels(df['row'].astype(str))
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'Cell_cycle_barplot.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Stacked bar plot saved: {plot_path}")
+    
 def process_image_wrapper(args):
     return process_image(*args)
 
@@ -387,12 +417,15 @@ def main():
         results_path = os.path.join(output_dir, "Results.csv")
         df.to_csv(results_path, index=False)
         print(f"Results saved: {len(rows)} samples analyzed")
+        plot_cell_cycle(results_path, output_dir)
     else:
         print("No valid data for cell cycle analysis")
         
     #generate datapane report
     results_df = pd.read_csv(results_path)
     summary_table = dp.Table(results_df)
+    results_png = os.path.join(output_dir, f"Cell_cycle_barplot.png")
+    results_plot = dp.Media(file=results_png)
 
     sample_blocks = []
     for _, row in results_df.iterrows():
@@ -403,6 +436,7 @@ def main():
         hist_path       = os.path.join(output_dir, f"{sample_id}_histogram.png")
         final_model     = os.path.join(output_dir, f"{sample_id}_model.png")
         initial_model   = os.path.join(output_dir, f"{sample_id}_initial_model.png")
+        
 
         sample_blocks.append(
             dp.Group(
@@ -416,11 +450,12 @@ def main():
             )
         )
 
-    sample_select = dp.Select(blocks=sample_blocks)   # dropdown by sample name[web:86][web:87]
+    sample_select = dp.Select(blocks=sample_blocks, type=dp.SelectType.DROPDOWN)   # dropdown by sample name[web:86][web:87]
 
     report = dp.Report(
         dp.Text("# Cell cycle analysis report"),
         dp.Text("## Summary"),
+        results_plot,
         summary_table,
         dp.Text("## Per-sample details"),
         sample_select,
@@ -431,3 +466,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
