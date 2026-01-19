@@ -17,6 +17,10 @@ import datetime
 from concurrent.futures import ProcessPoolExecutor
 from scipy.stats import iqr
 import datapane as dp
+from skimage.color import label2rgb
+from skimage.util import img_as_ubyte
+import imageio.v2 as imageio
+import tifffile as tiff
 
 
 def compute_histogram(values, q=0.99):
@@ -26,11 +30,60 @@ def compute_histogram(values, q=0.99):
     upper = np.quantile(values, q)
     return np.histogram(values, bins=no_of_bins, range=(0, upper))
 
-def s_phase_component(x, mu1, mu2, sigma_s, A_s, n_u = 100):
-    u = np.linspace(mu1, mu2, n_u)
-    gaussian = np.exp(-0.5 * ((x[:, None] - u[None, :]) / sigma_s)**2)
-    S = np.trapz(gaussian, u)
-    return A_s * S / S.max()
+def s_phase_component(x, x_vals, A, B, C, Ns, x_s, sigma_s, sigma1_S, x1):
+    """
+    Compute F_s(x) with a two-term discrete summation (j = 1, 2).
+
+    Parameters
+    ----------
+    x : float
+        Evaluation point:
+    x_vals : array-like of length 2
+        Values [x_1, x_2]:
+    A, B, C : float
+        Polynomial coefficients:
+    Ns : float
+        Gaussian normalization:
+    x_s : float
+        Center of the signal Gaussian:
+    sigma_s : float
+        Width of the signal Gaussian:
+    sigma1 : float
+        Base smoothing width:
+    x1 : float
+        Reference scale (x_1 in the formula):
+
+    Returns
+    -------
+    float
+        Value of F_s(x):
+    """
+
+    x_vals = np.asarray(x_vals)
+
+    def f(xj):
+        return (
+            A
+            + B * xj
+            + C * xj**2
+            + Ns / (np.sqrt(2.0 * np.pi) * sigma_s)
+            * np.exp(-(xj - x_s)**2 / (2.0 * sigma_s**2))
+        )
+
+    Fs = 0.0
+    for xj in x_vals:
+        sigma_eff = sigma1_S * (xj / x1)
+        Fs += (
+            f(xj)
+            / (np.sqrt(2.0 * np.pi) * sigma_eff)
+            * np.exp(-(x - xj)**2 / (2.0 * sigma_eff**2))
+        )
+        # enforce S only between x1_s and x2_s
+    x_min, x_max = np.min(x_vals), np.max(x_vals)
+    mask = (x >= x_min) & (x <= x_max)
+    Fs[~mask] = 0.0
+
+    return Fs
 
 def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area):
     start = datetime.datetime.now()
@@ -121,12 +174,8 @@ def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area
 
     start = datetime.datetime.now()
     # Save the resulting masks
-    mask_path = os.path.join(output_dir, f"{name}_mask.png")
-    plt.figure(figsize = (8,8))
-    plt.imshow(labels_filtered, cmap="nipy_spectral")
-    plt.title('Nuclei masks')
-    plt.savefig(mask_path)
-    plt.close()
+    mask_path = os.path.join(output_dir, f"{name}_mask.tif")
+    tiff.imwrite(mask_path, labels_filtered.astype(np.uint32, copy=False), compression="zlib")
     
     end = datetime.datetime.now()
     duration = end - start
@@ -203,45 +252,127 @@ def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area
     duration = end - start
     print("Histogram generation completed, execution time: ", duration)
     
-def djf_model(x, N1, mu1, sigma1, N2, mu2, sigma2, A_s, sigma_s):
-    
-    G1 = N1 * np.exp(-(x - mu1)**2 / (2*sigma1**2))
-    G2 = N2 * np.exp(-(x - mu2)**2 / (2*sigma2**2))
-    S = s_phase_component(x, mu1, mu2, sigma_s, A_s)    
+def djf_model(
+    x,
+    N1, mu1, sigma1,
+    N2, mu2, sigma2,
+    A, B, C, Ns, x_s, sigma_s, sigma1_S,
+    k1=1.05, k2=0.95, n_pts=25
+):
+    sigma1 = max(sigma1, 1e-12)
+    sigma2 = max(sigma2, 1e-12)
+    sigma_s = max(sigma_s, 1e-12)
+    sigma1_S = max(sigma1_S, 1e-12)
+
+    # Same normalization you already use
+    G1 = (N1/(np.sqrt(2*np.pi)*sigma1)) * np.exp(-(x - mu1)**2 / (2*sigma1**2))
+    G2 = (N2/(np.sqrt(2*np.pi)*sigma2)) * np.exp(-(x - mu2)**2 / (2*sigma2**2))
+
+    # Tie endpoints + reference
+    x1_ref = max(mu1, 1e-12)
+    x1_s = mu1 * k1
+    x2_s = mu2 * k2
+    if x2_s <= x1_s:
+        # fallback (rare when mu2 ~ mu1)
+        x1_s = mu1 * 1.02
+        x2_s = mu2 * 0.98
+
+    x_vals = np.linspace(x1_s, x2_s, n_pts)
+
+    S = s_phase_component(
+        x,
+        x_vals=x_vals,
+        A=A, B=B, C=C,
+        Ns=Ns, x_s=x_s, sigma_s=sigma_s,
+        sigma1_S=sigma1_S, x1=x1_ref
+    )
+
     return G1 + S + G2
 
-def estimate_initial_p0(x, y):
-    peaks, _ = find_peaks(y, prominence=0.05 * np.max(y))
-    if len(peaks) == 0:
-        raise ValueError("No peaks found in the histogram.")
-      
-    #G1 assumptions
-    g1_index = peaks[np.argmax(y[peaks])]
-    mu1 = x[g1_index]
-    N1 = y[g1_index]
-
-    half_max = N1 / 2
-    left = np.where(y[:g1_index] < half_max)[0]
-    right = np.where(y[g1_index:] < half_max)[0]
-    if left.size > 0 and right.size > 0:
-        l = x[left[-1]]
-        r = x[g1_index + right[0]]
-        sigma1 = (r - l) / 2.3548  # FWHM to sigma
-    else:
-        sigma1 = (x[-1] - x[0]) / 20  # fallback
-
-    # G2 assumptions
-    mu2 = 1.75 * mu1
-    N2 = N1 * 0.5
-    sigma2 = sigma1 * 1.1
+def estimate_initial_p0(x, y, q=0.99):
     
-    # S assumptions
-    sigma_s = (mu2 - mu1) / 4
-    s_range = (x > mu1 * 1.05) & (x < mu2 * 0.95)
-    A_s = np.min(y[s_range])
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    y_smooth = ndi.gaussian_filter1d(y.astype(float), sigma=2)
+    
+    # 1. Find G1, G2 peaks (first/second major peaks)
+    peaks, _ = find_peaks(y_smooth, prominence=0.05*np.max(y_smooth))
+    if len(peaks) < 2:
+        peaks = np.linspace(0, len(y)-1, 2, dtype=int)  # Fallback
+    
+    g1_peak = peaks[np.argmax(y_smooth[peaks[:len(peaks)//2]])]
+    g2_peak = peaks[len(peaks)//2 + np.argmax(y_smooth[peaks[len(peaks)//2:]])]
+    
+    # G1 params
+    mu1 = x[g1_peak]
+    N1 = y_smooth[g1_peak] * np.std(x[y_smooth > y_smooth[g1_peak]*0.5]) * np.sqrt(2*np.pi)
+    mask1 = y_smooth > y_smooth[g1_peak]*0.5
+    sigma1 = np.std(x[mask1]) if np.any(mask1) else (x[-1]-x[0])/20
+    
+    # G2 params  
+    mu2 = x[g2_peak]
+    N2 = y_smooth[g2_peak] * np.std(x[y_smooth > y_smooth[g2_peak]*0.5]) * np.sqrt(2*np.pi)
+    mask2 = y_smooth > y_smooth[g2_peak]*0.5
+    sigma2 = np.std(x[mask2]) if np.any(mask2) else (x[-1]-x[0])/20
+    
+    # 2. S-phase params: x_vals = [x1,x2] between G1/G2
+    x1_s = mu1 * 1.05
+    x2_s = mu2 * 0.95
+    if x2_s <= x1_s:
+        x1_s = mu1 * 1.02
+        x2_s = mu2 * 0.98
 
+    valley = (x > x1_s) & (x < x2_s)
+    if np.count_nonzero(valley) >= 5:
+        c2, c1, c0 = np.polyfit(x[valley], y_smooth[valley], 2)
+        A, B, C = float(c0), float(c1), float(c2)
+        valley_mean = float(np.mean(y_smooth[valley]))
+    else:
+        A, B, C = float(np.min(y_smooth)), 0.0, 0.0
+        valley_mean = float(np.min(y_smooth))
 
-    return [N1, mu1, sigma1, N2, mu2, sigma2, A_s, sigma_s]
+    # Make Ns conservative to avoid initial spike
+    Ns = max(valley_mean * 0.2, 1e-6)
+
+    x_s = float(0.5*(x1_s + x2_s))
+    sigma_s = max(float((x2_s - x1_s)/10), 1e-6)
+    sigma1_S = max(float(0.6*np.mean([sigma1, sigma2])), 1e-6)
+
+    p0 = [N1, mu1, sigma1, N2, mu2, sigma2, A, B, C, Ns, x_s, sigma_s, sigma1_S]
+    p0 = np.asarray(p0, float)
+    p0[~np.isfinite(p0)] = 1e-6
+    return p0.tolist()
+
+def djf_components_from_params(x, params, k1=1.05, k2=0.95, n_pts=25):
+    (N1, mu1, sigma1,
+     N2, mu2, sigma2,
+     A, B, C, Ns, x_s, sigma_s, sigma1_S) = params
+    
+    sigma1 = max(float(sigma1), 1e-12)
+    sigma2 = max(float(sigma2), 1e-12)
+    sigma_s = max(float(sigma_s), 1e-12)
+    sigma1_S = max(float(sigma1_S), 1e-12)
+
+    G1 = (N1 / (np.sqrt(2*np.pi) * sigma1)) * np.exp(-(x - mu1)**2 / (2*sigma1**2))
+    G2 = (N2 / (np.sqrt(2*np.pi) * sigma2)) * np.exp(-(x - mu2)**2 / (2*sigma2**2))
+    
+    x1_ref = max(float(mu1), 1e-12)
+    x1_s = float(mu1) * k1
+    x2_s = float(mu2) * k2
+    if x2_s <= x1_s:
+        x1_s = float(mu1) * 1.02
+        x2_s = float(mu2) * 0.98
+
+    x_vals = np.linspace(x1_s, x2_s, n_pts)
+    
+    S  = s_phase_component(
+        x,
+        x_vals=x_vals,
+        A=A, B=B, C=C,
+        Ns=Ns, x_s=x_s, sigma_s=sigma_s,
+        sigma1_S=sigma1_S, x1=x1_ref)
+    
+    return G1, S, G2
 
 def quantify_cell_cycle(filepath, name, output_dir, rows):
     start = datetime.datetime.now()
@@ -276,7 +407,25 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     start = datetime.datetime.now()
     print("Fitting the model to the data")
     p0 = estimate_initial_p0(bin_centers, counts)
-    params, cov = curve_fit(djf_model, bin_centers, counts, p0=p0, bounds=((0, 0, 0, 0, 0, 0, 0, 0), (np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf)))
+    print("p0:", p0)
+    print("any nonfinite:", any([not np.isfinite(v) for v in p0]))
+    print("min p0:", np.min(p0))
+    
+    lower = [0]*13
+    upper = [np.inf]*13
+
+    # Allow polynomial coeffs A,B,C to be negative:
+    # Param order: [N1,mu1,sigma1, N2,mu2,sigma2, x1_s,x2_s, A,B,C, Ns,x_s,sigma_s,sigma1_S,x1_ref]
+    lower[6]  = -np.inf  # A
+    lower[7]  = -np.inf  # B
+    lower[8] = -np.inf  # C
+
+    params, cov = curve_fit(
+        djf_model, bin_centers, counts,
+        p0=p0,
+        bounds=(lower, upper),
+        maxfev=20000
+    )
     fitted = djf_model(bin_centers, *params)
     model_function = djf_model(bin_centers, *p0)
     end = datetime.datetime.now()
@@ -286,15 +435,8 @@ def quantify_cell_cycle(filepath, name, output_dir, rows):
     start = datetime.datetime.now()
     print("Calculating model components")
     #fitted model components
-    G1 = params[0] * np.exp(-(bin_centers - params[1])**2 / (2*params[2]**2))
-    G2 = params[3] * np.exp(-(bin_centers - params[4])**2 / (2*params[5]**2))
-    S = s_phase_component(bin_centers, params[1], params[4], params[7], params[6])
-    
-    #intitial model components
-    
-    G1_p0 = p0[0] * np.exp(-(bin_centers - p0[1])**2 / (2*p0[2]**2))
-    G2_p0 = p0[3] * np.exp(-(bin_centers - p0[4])**2 / (2*p0[5]**2))
-    S_p0 = s_phase_component(bin_centers, p0[1], p0[4], p0[7], p0[6])
+    G1, S, G2 = djf_components_from_params(bin_centers, params)
+    G1_p0, S_p0, G2_p0 = djf_components_from_params(bin_centers, p0)
     
     end = datetime.datetime.now()
     duration = end - start
@@ -418,51 +560,74 @@ def main():
         df.to_csv(results_path, index=False)
         print(f"Results saved: {len(rows)} samples analyzed")
         plot_cell_cycle(results_path, output_dir)
-    else:
-        print("No valid data for cell cycle analysis")
-        
-    #generate datapane report
-    results_df = pd.read_csv(results_path)
-    summary_table = dp.Table(results_df)
-    results_png = os.path.join(output_dir, f"Cell_cycle_barplot.png")
-    results_plot = dp.Media(file=results_png)
 
-    sample_blocks = []
-    for _, row in results_df.iterrows():
-        sample_id = row["ID"]
-        n_cells = int(row["n_cells"])
+        # Generate datapane report (handles 0, 1, or many samples)
+        results_df = pd.read_csv(results_path)
+        summary_table = dp.Table(results_df)
+        results_png = os.path.join(output_dir, "Cell_cycle_barplot.png")
+        results_plot = dp.Media(file=results_png)
 
-        mask_path       = os.path.join(output_dir, f"{sample_id}_mask.png")
-        hist_path       = os.path.join(output_dir, f"{sample_id}_histogram.png")
-        final_model     = os.path.join(output_dir, f"{sample_id}_model.png")
-        initial_model   = os.path.join(output_dir, f"{sample_id}_initial_model.png")
-        
+        if len(results_df) == 0:
+            print("No samples for detailed report")
+            report_blocks = [dp.Text("No valid samples found")]
+        elif len(results_df) == 1:
+            # Single sample: show directly (no Select needed)
+            row = results_df.iloc[0]
+            sample_id = row["ID"]
+            n_cells = int(row["n_cells"])
 
-        sample_blocks.append(
-            dp.Group(
+            mask_path = os.path.join(output_dir, f"{sample_id}_mask.tif")
+            hist_path = os.path.join(output_dir, f"{sample_id}_histogram.png")
+            final_model = os.path.join(output_dir, f"{sample_id}_model.png")
+            initial_model = os.path.join(output_dir, f"{sample_id}_initial_model.png")
+
+            single_sample = dp.Group(
                 dp.Text(f"### Sample: {sample_id}"),
                 dp.Text(f"Total nuclei: **{n_cells}**"),
                 dp.Media(file=mask_path, caption="Nuclei masks"),
                 dp.Media(file=hist_path, caption="DAPI intensity histogram"),
                 dp.Media(file=initial_model, caption="Initial model components"),
                 dp.Media(file=final_model, caption="Fitted model"),
-                label=sample_id,
             )
+            report_blocks = [single_sample]
+        else:
+            # Multiple samples: use Select dropdown
+            sample_blocks = []
+            for _, row in results_df.iterrows():
+                sample_id = row["ID"]
+                n_cells = int(row["n_cells"])
+
+                mask_path = os.path.join(output_dir, f"{sample_id}_mask.tif")
+                hist_path = os.path.join(output_dir, f"{sample_id}_histogram.png")
+                final_model = os.path.join(output_dir, f"{sample_id}_model.png")
+                initial_model = os.path.join(output_dir, f"{sample_id}_initial_model.png")
+
+                sample_blocks.append(
+                    dp.Group(
+                        dp.Text(f"### Sample: {sample_id}"),
+                        dp.Text(f"Total nuclei: **{n_cells}**"),
+                        dp.Media(file=mask_path, caption="Nuclei masks"),
+                        dp.Media(file=hist_path, caption="DAPI intensity histogram"),
+                        dp.Media(file=initial_model, caption="Initial model components"),
+                        dp.Media(file=final_model, caption="Fitted model"),
+                        label=sample_id,
+                    )
+                )
+            report_blocks = [dp.Select(blocks=sample_blocks, type=dp.SelectType.DROPDOWN)]
+
+        report = dp.Report(
+            dp.Text("# Cell cycle analysis report"),
+            dp.Text("## Summary"),
+            results_plot,
+            summary_table,
+            dp.Text("## Per-sample details"),
+            *report_blocks  # Unpacks the list
         )
 
-    sample_select = dp.Select(blocks=sample_blocks, type=dp.SelectType.DROPDOWN)
-
-    report = dp.Report(
-        dp.Text("# Cell cycle analysis report"),
-        dp.Text("## Summary"),
-        results_plot,
-        summary_table,
-        dp.Text("## Per-sample details"),
-        sample_select,
-    )
-
-    report.save(path=os.path.join(output_dir, "report.html"), open=True)
-
+        report.save(path=os.path.join(output_dir, "report.html"), open=True)
+        print("Report saved: report.html")
+    else:
+        print("No valid data for cell cycle analysis")
 
 if __name__ == "__main__":
     main()
