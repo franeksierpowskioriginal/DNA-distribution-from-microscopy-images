@@ -51,6 +51,7 @@ from skimage.filters import threshold_otsu
 from skimage.segmentation import watershed
 
 INTENSITY_COL = "IntDen_bgsub"   # column used for the cell-cycle analysis
+BINNED_ABOVE = 1000              # use the binned likelihood above this many nuclei
 SQRT_2PI = np.sqrt(2.0 * np.pi)
 
 
@@ -63,8 +64,104 @@ def _timer(label, start):
     return datetime.datetime.now()
 
 
+def segment_nuclei(img, min_nucleus_area, max_nucleus_area, min_distance):
+    """Otsu threshold + distance-transform watershed.
+
+    Returns (labels, labels_all, binary): labels holds the accepted nuclei; labels_all
+    holds every segmented object (also the rejected ones), which enlarged masks must
+    not grow into; binary is the raw threshold mask, used to find background.
+    """
+    # Smoothing is used for segmentation only; intensities are measured on the raw image.
+    img_proc = skimage.filters.gaussian(img, sigma=0.8, preserve_range=True)
+    binary = img_proc > threshold_otsu(img_proc)
+    mask = ndi.binary_opening(ndi.binary_fill_holes(binary))
+
+    distance = ndi.gaussian_filter(ndi.distance_transform_edt(mask), 1)
+    coords = peak_local_max(distance, min_distance=min_distance, labels=mask)
+    seeds = np.zeros(mask.shape, dtype=np.int32)
+    seeds[tuple(coords.T)] = np.arange(1, len(coords) + 1)
+    labels_all = watershed(-distance, seeds, mask=mask)
+
+    labels = labels_all.copy()
+    # Remove nuclei touching the border
+    border = np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]))
+    labels[np.isin(labels, border[border > 0])] = 0
+    # Remove objects outside the accepted area range
+    areas = np.bincount(labels.ravel())
+    keep = (areas >= min_nucleus_area) & (areas <= max_nucleus_area)
+    keep[0] = False
+    labels[~keep[labels]] = 0
+    return labels, labels_all, binary
+
+
+def expand_masks(labels, labels_all, n_px):
+    """Grow every accepted mask outward by n_px pixels.
+
+    Growth goes only into pixels that belong to no segmented object, so a mask never
+    takes pixels from a neighbouring nucleus (or from a rejected object); where two
+    masks grow towards each other the gap is shared between them. Small nuclei lose
+    part of their blurred edge to the threshold, and including it makes the
+    integrated intensity much less dependent on where exactly the threshold fell.
+    """
+    out = labels.copy()
+    free = labels_all == 0
+    cross = ndi.generate_binary_structure(2, 1)
+    square = np.ones((3, 3), bool)
+    for i in range(n_px):
+        # alternate 4- and 8-neighbour steps: grows roughly circular, not square
+        grown = ndi.grey_dilation(out, footprint=cross if i % 2 == 0 else square)
+        take = free & (out == 0) & (grown > 0)
+        out[take] = grown[take]
+    return out
+
+
+def measure_nuclei(img, labels, labels_all, binary, expand_px=0):
+    """Per-nucleus measurements; intensities summed over masks enlarged by expand_px."""
+    # Background: median of pixels well away from any foreground object.
+    # Integrated intensity must be background-corrected, otherwise every nucleus
+    # gets an offset proportional to its area and the G2/G1 ratio is no longer ~2.
+    bg_region = ~ndi.binary_dilation(binary, iterations=max(5, expand_px + 3))
+    background = float(np.median(img[bg_region])) if np.any(bg_region) else 0.0
+
+    meas = expand_masks(labels, labels_all, expand_px) if expand_px > 0 else labels
+    n_lab = int(labels.max()) + 1
+    if n_lab <= 1:
+        return pd.DataFrame(), background
+
+    seg_area = np.bincount(labels.ravel(), minlength=n_lab)
+    lab = meas.ravel()
+    sel = lab > 0
+    lab, pix = lab[sel], img.ravel()[sel]
+    area = np.bincount(lab, minlength=n_lab)
+    rawintden = np.bincount(lab, weights=pix, minlength=n_lab)
+    min_vals = np.full(n_lab, np.inf)
+    max_vals = np.full(n_lab, -np.inf)
+    np.minimum.at(min_vals, lab, pix)
+    np.maximum.at(max_vals, lab, pix)
+    yy, xx = np.nonzero(labels)
+    ll = labels[yy, xx]
+    cy = np.bincount(ll, weights=yy, minlength=n_lab) / np.maximum(seg_area, 1)
+    cx = np.bincount(ll, weights=xx, minlength=n_lab) / np.maximum(seg_area, 1)
+
+    df = pd.DataFrame({
+        "ID": np.arange(n_lab),
+        "Y": cy,
+        "X": cx,
+        "Min": min_vals,
+        "Max": max_vals,
+        "Mean_int": np.divide(rawintden, area, out=np.zeros(n_lab), where=area > 0),
+        "RawIntDen": rawintden,
+        "Background": background,
+        INTENSITY_COL: rawintden - background * area,
+        "Area": seg_area,               # segmented area (used for the area filter)
+        "Area_measured": area,          # area after enlargement
+    })
+    df = df.iloc[1:]                    # row 0 is the background
+    return df[df["Area"] > 0], background
+
+
 def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area,
-                  min_distance):
+                  min_distance, expand_px=0):
     """Segment nuclei in one DAPI image and save per-nucleus measurements.
 
     Areas are in pixels. Returns the path of the per-image CSV, or None.
@@ -75,79 +172,46 @@ def process_image(filepath, name, output_dir, min_nucleus_area, max_nucleus_area
         raise ValueError(f"{name}: expected a single-channel 2D image, got shape {img.shape}")
     t = _timer(f"[{name}] Image loaded", t)
 
-    # Smoothing is used for segmentation only; intensities are measured on the raw image.
-    img_proc = skimage.filters.gaussian(img, sigma=0.8, preserve_range=True)
+    labels, labels_all, binary = segment_nuclei(img, min_nucleus_area, max_nucleus_area,
+                                                min_distance)
+    t = _timer(f"[{name}] Segmentation completed", t)
 
-    binary = img_proc > threshold_otsu(img_proc)
-    mask = ndi.binary_opening(ndi.binary_fill_holes(binary))
-    t = _timer(f"[{name}] Thresholding completed", t)
-
-    # Watershed on the smoothed distance transform
-    distance = ndi.gaussian_filter(ndi.distance_transform_edt(mask), 1)
-    coords = peak_local_max(distance, min_distance=min_distance, labels=mask)
-    seeds = np.zeros(mask.shape, dtype=np.int32)
-    seeds[tuple(coords.T)] = np.arange(1, len(coords) + 1)
-    labels = watershed(-distance, seeds, mask=mask)
-    t = _timer(f"[{name}] Watershed completed", t)
-
-    # Remove nuclei touching the border
-    border = np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]))
-    labels[np.isin(labels, border[border > 0])] = 0
-
-    # Remove objects outside the accepted area range
-    areas = np.bincount(labels.ravel())
-    keep = (areas >= min_nucleus_area) & (areas <= max_nucleus_area)
-    keep[0] = False
-    labels[~keep[labels]] = 0
-    t = _timer(f"[{name}] Mask filtering completed", t)
-
+    # The PNG is 800 px wide: plot a subsampled label image (a full 9000 x 9000 label
+    # image would need several GB of memory inside matplotlib).
+    step = max(1, max(labels.shape) // 2000)
     plt.figure(figsize=(8, 8))
-    plt.imshow(labels, cmap="nipy_spectral", interpolation="nearest")
+    plt.imshow(labels[::step, ::step], cmap="nipy_spectral", interpolation="nearest",
+               extent=(0, labels.shape[1], labels.shape[0], 0))
     plt.title("Nuclei masks")
     plt.savefig(os.path.join(output_dir, f"{name}_mask.png"))
     plt.close()
 
-    # Background: median of pixels well away from any foreground object.
-    # Integrated intensity must be background-corrected, otherwise every nucleus
-    # gets an offset proportional to its area and the G2/G1 ratio is no longer ~2.
-    bg_region = ~ndi.binary_dilation(binary, iterations=5)
-    background = float(np.median(img[bg_region])) if np.any(bg_region) else 0.0
-
-    lab = labels.ravel()
-    sel = lab > 0
-    if not np.any(sel):
-        print(f"[{name}] All nuclei were removed, intensity quantification skipped.")
-        return None
-    lab, pix = lab[sel], img.ravel()[sel]
-    n_lab = lab.max() + 1
-
-    area = np.bincount(lab, minlength=n_lab)
-    rawintden = np.bincount(lab, weights=pix, minlength=n_lab)
-    min_vals = np.full(n_lab, np.inf)
-    max_vals = np.full(n_lab, -np.inf)
-    np.minimum.at(min_vals, lab, pix)
-    np.maximum.at(max_vals, lab, pix)
-
-    df = pd.DataFrame({
-        "ID": np.arange(n_lab),
-        "Min": min_vals,
-        "Max": max_vals,
-        "Mean_int": np.divide(rawintden, area, out=np.zeros(n_lab), where=area > 0),
-        "RawIntDen": rawintden,
-        "Background": background,
-        INTENSITY_COL: rawintden - background * area,
-        "Area": area,
-    })
-    df = df[df["Area"] > 0]
+    df, background = measure_nuclei(img, labels, labels_all, binary, expand_px)
     if df.empty:
         print(f"[{name}] No valid nuclei found, skipping CSV generation")
         return None
 
     csv_path = os.path.join(output_dir, f"{name}.csv")
     df.to_csv(csv_path, index=False)
-    t = _timer(f"[{name}] Nuclei intensities calculated ({len(df)} nuclei, background {background:.1f})", t)
+    t = _timer(f"[{name}] Nuclei intensities calculated ({len(df)} nuclei, masks enlarged by "
+               f"{expand_px} px, background {background:.1f})", t)
 
     values = df[INTENSITY_COL].to_numpy(float)
+
+    # Spatial QC: nucleus intensity relative to the median, at its position in the image.
+    # A smooth gradient or blocks (tiles) mean uneven focus or illumination.
+    rel = values / np.median(values)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sc = ax.scatter(df["X"], df["Y"], c=rel, s=1, cmap="viridis", vmin=0.3, vmax=2.5,
+                    rasterized=True)
+    ax.set_xlim(0, img.shape[1])
+    ax.set_ylim(img.shape[0], 0)
+    ax.set_aspect("equal")
+    ax.set_title("Nucleus intensity / median (G1 ~1, G2 ~2)")
+    fig.colorbar(sc, ax=ax, fraction=0.046)
+    fig.savefig(os.path.join(output_dir, f"{name}_spatial.png"))
+    plt.close(fig)
+
     edges = display_bin_edges(values)
     plt.figure(figsize=(8, 8))
     plt.hist(values, bins=edges)
@@ -289,6 +353,24 @@ class DJFModel:
         dens = np.maximum(g1 + s + g2 + self.debris_density(x, theta), 1e-300)
         return self.expected_in_window(theta, lo, hi) - np.sum(np.log(dens))
 
+    def expected_in_bins(self, theta, edges):
+        """Expected number of nuclei in each bin (exact integral of the model over the bin)."""
+        p = self.unpack(theta)
+        mu1, mu2 = p["mu1"], p["r"] * p["mu1"]
+        g1 = p["n1"] * np.diff(ndtr((edges - mu1) / (p["cv1"] * mu1)))
+        g2 = p["n2"] * np.diff(ndtr((edges - mu2) / (p["cv2"] * mu2)))
+        wk, xk, sdk = self._s_nodes(p)
+        s = np.diff(ndtr((edges[:, None] - xk[None, :]) / sdk[None, :]) @ wk)
+        e = np.exp(-edges / p["td"])
+        return g1 + g2 + s + p["nd"] * (e[:-1] - e[1:])
+
+    def nll_binned(self, theta, edges, counts):
+        """Binned version of nll (Poisson likelihood over fine bins), for large samples.
+        With bins much narrower than the peaks it gives the same estimates as nll,
+        but the cost no longer grows with the number of nuclei."""
+        mu = np.maximum(self.expected_in_bins(theta, edges), 1e-300)
+        return mu.sum() - counts @ np.log(mu)
+
 
 def _narrow_kde(x):
     """KDE with half the Scott bandwidth: the DNA histogram is multimodal, and the
@@ -374,8 +456,18 @@ def fit_djf(values, synchronous=False, free_g2_cv=False, ratio_bounds=(1.7, 2.3)
     D = np.where(amp, float(n), 1.0)
     z_bounds = [(b[0] / d, b[1] / d) for b, d in zip(bounds, D)]
 
-    def objective(z):
-        return model.nll(z * D, x, lo, hi) / n
+    # Above BINNED_ABOVE nuclei the likelihood is evaluated on fine bins (width ~CV/10
+    # of G1, i.e. far narrower than any peak) instead of on every nucleus.
+    if len(x) > BINNED_ABOVE:
+        n_bins = int(np.clip((hi - lo) / (cv0 / 10), 200, 2000))
+        edges = np.linspace(lo, hi, n_bins + 1)
+        counts = np.histogram(x, bins=edges)[0].astype(float)
+
+        def objective(z):
+            return model.nll_binned(z * D, edges, counts) / n
+    else:
+        def objective(z):
+            return model.nll(z * D, x, lo, hi) / n
 
     # A few starts guard against local minima (e.g. G2 placed on an S-phase shoulder)
     starts = {float(np.clip(r, *ratio_bounds)) for r in (r0, 1.95, 2.0)}
@@ -511,6 +603,16 @@ def quantify_cell_cycle(filepath, name, output_dir, synchronous=False, free_g2_c
 # Summary outputs
 # ---------------------------------------------------------------------------
 
+def quantify_cell_cycle_wrapper(args):
+    """Runs in a worker process: fit one sample and return its row of Results.csv."""
+    filepath, name, output_dir, synchronous, free_g2_cv, ratio_bounds = args
+    warnings.filterwarnings("ignore", category=RuntimeWarning, module="scipy.optimize")
+    n_cells = len(pd.read_csv(filepath))
+    res = quantify_cell_cycle(filepath, name, output_dir, synchronous=synchronous,
+                              free_g2_cv=free_g2_cv, ratio_bounds=ratio_bounds)
+    return {"ID": name, "n_cells": n_cells, **(res or {})}
+
+
 def plot_cell_cycle(results_csv_path, output_dir):
     df = pd.read_csv(results_csv_path)
     x = np.arange(len(df))
@@ -533,7 +635,7 @@ def plot_cell_cycle(results_csv_path, output_dir):
     print(f"Stacked bar plot saved: {plot_path}")
 
 
-def build_report(results_df, output_dir, pixel_size, min_area, max_area):
+def build_report(results_df, output_dir, pixel_size, min_area, max_area, expand_px=0):
     try:
         import datapane as dp
     except ImportError:
@@ -547,6 +649,7 @@ def build_report(results_df, output_dir, pixel_size, min_area, max_area):
             dp.Text(f"### Sample: {sid}"),
             dp.Text(f"Total nuclei: **{int(row['n_cells'])}**"),
             dp.Media(file=os.path.join(output_dir, f"{sid}_mask.png"), caption="Nuclei masks"),
+            dp.Media(file=os.path.join(output_dir, f"{sid}_spatial.png"), caption="Intensity across the image"),
             dp.Media(file=os.path.join(output_dir, f"{sid}_histogram.png"), caption="DAPI intensity histogram"),
             dp.Media(file=os.path.join(output_dir, f"{sid}_initial_model.png"), caption="Initial model"),
             dp.Media(file=os.path.join(output_dir, f"{sid}_model.png"), caption="Fitted model"),
@@ -564,7 +667,7 @@ def build_report(results_df, output_dir, pixel_size, min_area, max_area):
 
     report = dp.Report(
         dp.Text("# Cell cycle analysis report"),
-                dp.Text(f"Pixel size: **{pixel_size:g}** µm, nuclear area range: **{min_area:g}–{max_area:g}** µm²"),
+                dp.Text(f"Pixel size: **{pixel_size:g}** µm, nuclear area range: **{min_area:g}–{max_area:g}** µm², masks enlarged by **{expand_px}** px"),
         dp.Text("## Summary"),
         dp.Media(file=os.path.join(output_dir, "Cell_cycle_barplot.png")),
         dp.Table(results_df),
@@ -586,9 +689,13 @@ def parse_args():
     ap.add_argument("pixel_size", type=float, help="pixel size in um")
     ap.add_argument("min_area", type=float, help="minimum nuclear area in um^2")
     ap.add_argument("max_area", type=float, help="maximum nuclear area in um^2")
-    ap.add_argument("--workers", type=int, default=4, help="parallel workers for image processing")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="parallel workers for image processing and model fitting (default 4)")
     ap.add_argument("--min-distance", type=int, default=None,
                     help="watershed seed spacing in pixels (default: derived from min_area)")
+    ap.add_argument("--expand", type=int, default=0,
+                    help="enlarge each nuclear mask by this many pixels before summing the "
+                         "intensity (default 0). Useful when nuclei are only a few pixels wide.")
     ap.add_argument("--synchronous", action="store_true",
                     help="add Fox's Gaussian term to S phase (synchronised populations)")
     ap.add_argument("--free-g2-cv", action="store_true",
@@ -613,20 +720,17 @@ def main():
     tif_files = sorted(glob.glob(os.path.join(args.input_dir, "*.tif"))
                        + glob.glob(os.path.join(args.input_dir, "*.tiff")))
     tasks = [(f, os.path.splitext(os.path.basename(f))[0], args.output_dir, min_px, max_px,
-              min_distance) for f in tif_files]
+              min_distance, args.expand) for f in tif_files]
 
     print(f"Processing {len(tasks)} images...")
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         csv_files = [c for c in executor.map(process_image_wrapper, tasks) if c]
 
-    print("Quantifying cell cycle phases...")
-    rows = []
-    for filepath in csv_files:
-        name = os.path.splitext(os.path.basename(filepath))[0]
-        n_cells = len(pd.read_csv(filepath))
-        res = quantify_cell_cycle(filepath, name, args.output_dir, synchronous=args.synchronous,
-                                  free_g2_cv=args.free_g2_cv, ratio_bounds=tuple(args.ratio))
-        rows.append({"ID": name, "n_cells": n_cells, **(res or {})})
+    print(f"Quantifying cell cycle phases ({len(csv_files)} samples, {args.workers} workers)...")
+    fit_tasks = [(f, os.path.splitext(os.path.basename(f))[0], args.output_dir,
+                  args.synchronous, args.free_g2_cv, tuple(args.ratio)) for f in csv_files]
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        rows = list(executor.map(quantify_cell_cycle_wrapper, fit_tasks))
 
     if not rows:
         print("No valid data for cell cycle analysis")
@@ -639,7 +743,8 @@ def main():
     results_df.to_csv(results_path, index=False)
     print(f"Results saved: {len(results_df)} samples, {results_df['frac_G1'].notna().sum()} fitted")
     plot_cell_cycle(results_path, args.output_dir)
-    build_report(results_df, args.output_dir, args.pixel_size, args.min_area, args.max_area)
+    build_report(results_df, args.output_dir, args.pixel_size, args.min_area, args.max_area,
+                 args.expand)
 
 
 if __name__ == "__main__":
